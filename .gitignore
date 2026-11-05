@@ -1,0 +1,30 @@
+# Credentials
+.env
+creds.json
+
+# Logs and traces
+logs/
+*.log
+*.jsonl
+
+# Challenge data (downloaded at runtime) — keep only the example templates
+/challenges/*
+!/challenges/_example-file/
+!/challenges/_example-instance/
+challenges-*/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.mypy_cache/
+.ruff_cache/
+uv.lock
+
+# Runtime
+workspace/
+codex-schema-*/
+.claude/scheduled_tasks.lock

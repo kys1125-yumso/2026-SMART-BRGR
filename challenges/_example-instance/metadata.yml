@@ -1,0 +1,10 @@
+# 인스턴스형 문제 템플릿 (5문항 유형, 대회장 WiFi에서만 접속됨)
+# DAKER에서 인스턴스 생성 후 표시된 접속 주소를 connection_info에 넣으세요.
+#   uv run ctf-solve --challenge challenges/<이폴더> --no-submit -v
+name: "sample-instance-chall"
+category: "web"                # 인스턴스형은 주로 web/pwn
+value: 300
+description: |
+  문제 지문을 붙여넣으세요. FLAG 형식 DAKER{...}.
+# 접속 주소를 그대로: 웹이면 http://IP:PORT, pwn이면 "nc IP PORT"
+connection_info: "http://10.x.x.x:12345"

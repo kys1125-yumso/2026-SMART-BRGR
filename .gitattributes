@@ -1,0 +1,17 @@
+# 저장소 안에서는 LF로 정규화(리눅스 샌드박스에서 도는 셸/파이썬 스크립트 보호).
+* text=auto eol=lf
+
+# 셸 스크립트는 반드시 LF (CRLF면 리눅스에서 '\r' 때문에 실행 실패)
+*.sh text eol=lf
+
+# PowerShell 스크립트는 Windows에서 쓰므로 CRLF 유지 (BOM 보존)
+*.ps1 text eol=crlf
+
+# 바이너리/이미지는 변환 금지
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary
+*.bin binary

@@ -1,0 +1,10 @@
+# 파일형 문제 템플릿 (20문항 유형)
+# distfiles/ 에 받은 첨부파일을 넣고, 아래 값을 채운 뒤:
+#   uv run ctf-solve --challenge challenges/<이폴더> --no-submit -v
+name: "sample-file-chall"      # 문제 이름(자유)
+category: "crypto"             # web | pwn | forensics | reverse | crypto | misc
+value: 500                     # 배점(표시용, 동작에 영향 없음)
+description: |
+  여기에 문제 설명(지문)을 그대로 붙여넣으세요.
+  예: 첨부된 sample.zip 안의 값을 복원해 FLAG를 구하세요. 형식은 DAKER{...}.
+connection_info: ""            # 파일형은 비워둠
