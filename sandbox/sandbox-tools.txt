@@ -8,6 +8,27 @@ curl               HTTP client. -s silent, -k skip TLS, -d data, -H header.
 wget               HTTP download. wget -O file url.
 nmap               Port scanner. nmap -sV host, nmap -p- host.
 
+== WEB / BROWSER ==
+playwright         Headless Chromium. Use it to actually RUN a web target instead of
+                   only reading its source: confirm a payload fires, see what a CSP
+                   blocks, read console errors, drive an admin-bot style flow.
+                   It launches as-is here (this container runs with SYS_ADMIN and
+                   seccomp=unconfined, so Chrome's own sandbox works). Add
+                   --disable-dev-shm-usage if a heavy page crashes the tab:
+                   /dev/shm is only 64MB. Add --no-sandbox only if you actually
+                   see a sandbox error.
+                     from playwright.sync_api import sync_playwright
+                     with sync_playwright() as p:
+                         b = p.chromium.launch(args=["--disable-dev-shm-usage"])
+                         pg = b.new_page()
+                         pg.on("console", lambda m: print("CONSOLE:", m.type, m.text))
+                         pg.on("pageerror", lambda e: print("PAGEERROR:", e))
+                         pg.goto("http://target/", wait_until="networkidle")
+                         print(pg.content())
+                   For local HTML: pg.set_content("<html>...</html>") — note this
+                   has no CSP, so also test against the real server response.
+                   ignore_https_errors=True on new_context() for self-signed certs.
+
 == BINARY ANALYSIS ==
 file               Identify file type. file binary
 strings            Extract printable strings. strings -n 8 binary
@@ -101,8 +122,10 @@ keras              Keras deep learning. import keras — model loading, inferenc
 PyJWT              JWT encode/decode. import jwt; jwt.encode(payload, key, algorithm='HS256')
 
 == NOTES ==
-- Sandbox runs ARM64. Do NOT execute x86/x86-64 binaries locally.
-  Use Ghidra tools for RE, and interact with remote services for dynamic analysis.
+- Check the architecture before assuming anything: `uname -m`. On x86_64 you can
+  run challenge binaries locally, so use dynamic analysis — gdb, ltrace, strace,
+  and angr with concrete execution. Only fall back to static-only RE (and to
+  poking the remote service) when `file` says the binary targets another arch.
 - Need a package not listed? Run `pip install <pkg>` or `uv pip install <pkg>`.
 - Distfiles are at /challenge/distfiles/ (read-only)
 - Write generated/repaired files to /challenge/workspace/ (writable)

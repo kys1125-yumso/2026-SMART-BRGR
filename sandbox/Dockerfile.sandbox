@@ -153,3 +153,12 @@ RUN pip3 install --no-cache-dir --force-reinstall "scipy>=1.13" matplotlib
 # Keras 3 is multi-backend and defaults to TensorFlow, which is not installed
 # (import fails on `from tensorflow.python.trackable...`). Point it at torch.
 ENV KERAS_BACKEND=torch
+
+# Headless Chromium via Playwright, for web challenges. Without a browser the
+# solver can only read a target's source: it cannot check whether a payload
+# actually fires, how a CSP behaves in practice, or what an admin-bot style
+# target does with an injected page — and those questions decide web challenges.
+# Installed last so every layer above stays cached.
+RUN pip3 install --no-cache-dir playwright \
+    && playwright install --with-deps chromium \
+    && python3 -c "from playwright.sync_api import sync_playwright; print('playwright ok')"
