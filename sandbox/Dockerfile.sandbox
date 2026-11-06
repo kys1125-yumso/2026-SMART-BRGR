@@ -140,3 +140,25 @@ COPY sandbox/sandbox-tools.txt /tools.txt
 COPY skills /skills
 
 WORKDIR /challenge
+
+# --- Fixups -----------------------------------------------------------------
+# apt ships scipy 1.8.0 / matplotlib built against the numpy 1.x C ABI, and the
+# pip step above is a no-op for them ("Requirement already satisfied"). The
+# PyTorch/Keras step then pulls numpy 2.x into /usr/local, which shadows apt's
+# numpy 1.21.5 and breaks every numpy-1-ABI C extension: scipy.linalg,
+# scipy.fft, scipy.stats and matplotlib all raise at call time. Reinstall both
+# from pip so numpy-2-compatible builds shadow the apt versions.
+RUN pip3 install --no-cache-dir --force-reinstall "scipy>=1.13" matplotlib
+
+# Keras 3 is multi-backend and defaults to TensorFlow, which is not installed
+# (import fails on `from tensorflow.python.trackable...`). Point it at torch.
+ENV KERAS_BACKEND=torch
+
+# Headless Chromium via Playwright, for web challenges. Without a browser the
+# solver can only read a target's source: it cannot check whether a payload
+# actually fires, how a CSP behaves in practice, or what an admin-bot style
+# target does with an injected page — and those questions decide web challenges.
+# Installed last so every layer above stays cached.
+RUN pip3 install --no-cache-dir playwright \
+    && playwright install --with-deps chromium \
+    && python3 -c "from playwright.sync_api import sync_playwright; print('playwright ok')"

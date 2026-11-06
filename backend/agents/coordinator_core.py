@@ -143,7 +143,7 @@ async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model
         return "No tracer on solver"
     path = trace_path.path if hasattr(trace_path, "path") else str(trace_path)
     try:
-        lines = Path(path).read_text().strip().split("\n")
+        lines = Path(path).read_text(encoding="utf-8").strip().split("\n")
         recent = lines[-last_n:]
         summary = []
         for line in recent:

@@ -1,9 +1,18 @@
-"""Claude Agent SDK solver — native tools with execution hooks.
+"""Claude Agent SDK solver — in-process sandbox tool, no host shell.
 
-Uses Claude's native Bash tool, but intercepts every command via a PreToolUse
-hook and rewrites it to run inside the Docker sandbox via `docker exec`. Read,
-Write, and Edit are blocked — the model uses bash for all file operations.
-Flag submission is intercepted from bash commands matching `submit_flag <flag>`.
+Exposes a single `bash` tool through an in-process SDK MCP server. The tool runs
+commands inside the Docker sandbox with `DockerSandbox.exec()` (aiodocker, talking
+to the Docker API directly), so nothing is ever executed by a shell on the host.
+This mirrors the Codex solver, which drives the same `do_bash` helper.
+
+The native host tools (Bash, Read, Write, Edit, Glob, Grep, ...) are denied by a
+PreToolUse hook: they would run on the host filesystem and break sandbox
+isolation. Flag submission is intercepted from `submit_flag <flag>` commands.
+
+Earlier revisions rewrote each command to `docker exec ... bash -c ...` and let
+the SDK run it through the host's Bash tool. That made every command depend on a
+working Git Bash, which is fragile on Windows (MSYS2 fork fails outright under
+mandatory ASLR). The MCP tool removes the host shell from the path entirely.
 """
 
 from __future__ import annotations
@@ -11,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import shlex
 import time
 
 from claude_agent_sdk import (
@@ -21,19 +29,43 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    create_sdk_mcp_server,
+    tool,
 )
 
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
-from backend.models import model_id_from_spec
+from backend.models import effort_from_spec, model_id_from_spec
 from backend.output_types import solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
 from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, QUOTA_ERROR, SolverResult
+from backend.tools.core import do_bash
 from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
+
+# Native tools that would act on the host instead of the sandbox. The PreToolUse
+# hook already refuses them, but a refusal still costs a turn: traces show both
+# solvers spending their first three steps on Bash -> ToolSearch -> Read/
+# PowerShell/Agent before settling on mcp__sandbox__bash. Naming them here keeps
+# them out of the model's reach so it reaches for the sandbox tool first.
+HOST_TOOLS_TO_DENY = [
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "PowerShell",
+    "Read",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "Agent",
+    "ToolSearch",
+    "Skill",
+]
 
 
 class ClaudeSolver:
@@ -72,8 +104,14 @@ class ClaudeSolver:
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
         )
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_id)
-        self.agent_name = f"{meta.name}/{self.model_id}"
+        # Two specs can share a model_id and differ only by effort (medium vs
+        # max). model_id alone would give both solvers the same trace filename
+        # and the same log prefix, so their events interleave in one file.
+        # effort stays None when the spec omits it; that is what the SDK wants.
+        self.effort = effort_from_spec(model_spec)
+        label = f"{self.model_id}-{self.effort or 'default'}"
+        self.tracer = SolverTracer(meta.name, label)
+        self.agent_name = f"{meta.name}/{label}"
 
         self._client: ClaudeSDKClient | None = None
         self._session_id: str | None = None
@@ -99,7 +137,9 @@ class ClaudeSolver:
             "All files are under /challenge/ — distfiles at /challenge/distfiles/, "
             "workspace at /challenge/workspace/. The ONLY path outside /challenge/ you may use is "
             "/skills/ (READ-ONLY CTF technique library — cat/ls it for help). "
-            "All bash commands run inside the container via docker exec. "
+            "Your ONLY tool is `bash` (shown as `mcp__sandbox__bash`). It runs the command "
+            "inside the container and returns its output. The native Bash/Read/Write/Edit/"
+            "Glob/Grep tools are unavailable — they would run on the host, not in the sandbox. "
             "Use bash for everything: cat/head to read files, tee/echo> to write, find/grep to search. "
             "submit_flag 'FLAG' to submit. notify_coordinator 'MSG' to message the coordinator.\n\n"
         )
@@ -108,8 +148,98 @@ class ClaudeSolver:
             has_named_tools=False,
         )
 
-        # PreToolUse hook: rewrite Bash commands to run in the sandbox container.
-        # Block Read/Write/Edit — model should use bash for file access.
+        # Run one command in the container. Called only from the `bash` MCP tool
+        # below, so this is the single place where step accounting, loop
+        # detection, tracing and the submit_flag/notify_coordinator intercepts
+        # live. Execution goes through DockerSandbox.exec() (aiodocker), never
+        # through a shell on the host.
+        async def run_in_sandbox(command: str, timeout_seconds: int) -> str:
+            self._step_count += 1
+            step = self._step_count
+            self.tracer.tool_call("bash", {"command": command}, step)
+
+            loop_status = self.loop_detector.check("bash", command[:200])
+            if loop_status == "break":
+                self.tracer.event("loop_break", tool="bash", step=step)
+                return "Loop detected — this command keeps repeating. Try a different approach."
+
+            prefix = ""
+            if loop_status == "warn":
+                from backend.loop_detect import LOOP_WARNING_MESSAGE
+                prefix = f"{LOOP_WARNING_MESSAGE}\n\n"
+
+            stripped = command.strip()
+
+            # submit_flag '<flag>' — handled here, never run in the container
+            flag_match = re.match(r"submit_flag\s+['\"]?(.+?)['\"]?\s*$", stripped)
+            if flag_match:
+                flag_val = flag_match.group(1).strip()
+                if self.no_submit:
+                    out = f'DRY RUN — would submit "{flag_val}"'
+                else:
+                    if self.submit_fn:
+                        display, confirmed = await self.submit_fn(flag_val)
+                    else:
+                        from backend.tools.core import do_submit_flag
+                        display, confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag_val)
+                    out = display
+                    if confirmed:
+                        self._confirmed = True
+                        self._flag = flag_val
+                        self.tracer.event("flag_confirmed", flag=flag_val, step=step)
+                self.tracer.tool_result("bash", out[:500], step)
+                return prefix + out
+
+            # notify_coordinator '<message>'
+            notify_match = re.match(r"notify_coordinator\s+['\"]?(.+?)['\"]?\s*$", stripped)
+            if notify_match and self.notify_coordinator:
+                await self.notify_coordinator(notify_match.group(1).strip())
+                out = "Message sent to coordinator."
+                self.tracer.tool_result("bash", out, step)
+                return prefix + out
+
+            out = await do_bash(self.sandbox, command, timeout_seconds)
+            self.tracer.tool_result("bash", out[:500], step)
+
+            # Periodically surface what the sibling solvers have found. The
+            # PostToolUse hook does this for native tools; MCP tool results do
+            # not pass through it, so it is done here instead.
+            if step % 5 == 0 and self.message_bus:
+                from backend.tools.core import do_check_findings
+                findings = await do_check_findings(self.message_bus, self.model_spec)
+                if findings and "No new findings" not in findings:
+                    out = f"{out}\n\n[Findings from other agents]\n{findings}"
+
+            return prefix + out
+
+        @tool(
+            "bash",
+            "Run a bash command inside the Docker sandbox and return its output. "
+            "Everything lives in the container: challenge files under /challenge/, "
+            "the technique library under /skills/. This is the only way to act.",
+            {"command": str, "timeout_seconds": int},
+        )
+        async def sandbox_bash(args):
+            command = str(args.get("command") or "")
+            if not command.strip():
+                return {"content": [{"type": "text", "text": "No command given."}]}
+            try:
+                timeout_seconds = int(args.get("timeout_seconds") or 60)
+            except (TypeError, ValueError):
+                timeout_seconds = 60
+            try:
+                text = await run_in_sandbox(command, timeout_seconds)
+            except Exception as e:
+                logger.warning(f"[{self.agent_name}] sandbox bash failed: {e}")
+                text = f"Tool error: {e}"
+            return {"content": [{"type": "text", "text": text}]}
+
+        sandbox_server = create_sdk_mcp_server(name="sandbox", tools=[sandbox_bash])
+
+        # PreToolUse hook: deny the native host tools. Bash/Read/Write/Edit/
+        # Glob/Grep would act on the host filesystem rather than the container,
+        # which breaks sandbox isolation — and on Windows the host shell may not
+        # work at all. The model is pointed at mcp__sandbox__bash instead.
         async def sandbox_redirect(input_data, tool_use_id, context):
             try:
                 return await _sandbox_redirect_inner(input_data, tool_use_id, context)
@@ -122,107 +252,33 @@ class ClaudeSolver:
                 return {}
 
             tool_name = input_data.get("tool_name", "")
-            tool_input = input_data.get("tool_input", {})
 
-            # Step counting and loop detection for all tools
+            # The sandbox tool accounts for itself inside run_in_sandbox().
+            # StructuredOutput must pass through: it is how output_format reports
+            # the final flag_found payload. Denying it loses the flag even when
+            # the solver has already decrypted it.
+            if tool_name.startswith("mcp__sandbox__") or tool_name in (
+                "WebFetch",
+                "WebSearch",
+                "StructuredOutput",
+            ):
+                return {}
+
             self._step_count += 1
-            self.tracer.tool_call(tool_name, tool_input, self._step_count)
-            loop_status = self.loop_detector.check(tool_name, str(tool_input)[:200])
-            if loop_status == "break":
-                self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": "Loop detected — try a different approach.",
-                    }
-                }
-            warn_msg = ""
-            if loop_status == "warn":
-                from backend.loop_detect import LOOP_WARNING_MESSAGE
-                warn_msg = LOOP_WARNING_MESSAGE
+            self.tracer.tool_call(tool_name, input_data.get("tool_input", {}), self._step_count)
 
-            if tool_name == "Bash":
-                command = tool_input.get("command", "")
-
-                # Intercept submit_flag commands — handle submission directly
-                flag_match = re.match(r"submit_flag\s+['\"]?(.+?)['\"]?\s*$", command.strip())
-                if flag_match:
-                    flag_val = flag_match.group(1).strip()
-                    if self.no_submit:
-                        result_msg = f'DRY RUN — would submit "{flag_val}"'
-                    else:
-                        if self.submit_fn:
-                            display, confirmed = await self.submit_fn(flag_val)
-                        else:
-                            from backend.tools.core import do_submit_flag
-                            display, confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag_val)
-                        result_msg = display
-                        if confirmed:
-                            self._confirmed = True
-                            self._flag = flag_val
-                            self.tracer.event("flag_confirmed", flag=flag_val, step=self._step_count)
-                    # Rewrite to an echo so Bash returns the submission result
-                    return {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "allow",
-                            "updatedInput": {
-                                **tool_input,
-                                "command": f"echo {shlex.quote(result_msg)}",
-                            },
-                        }
-                    }
-
-                # Intercept notify_coordinator commands
-                notify_match = re.match(r"notify_coordinator\s+['\"]?(.+?)['\"]?\s*$", command.strip())
-                if notify_match and self.notify_coordinator:
-                    msg = notify_match.group(1).strip()
-                    await self.notify_coordinator(msg)
-                    return {
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "allow",
-                            "updatedInput": {**tool_input, "command": "echo 'Message sent to coordinator.'"},
-                        }
-                    }
-
-                # Rewrite command to run in the Docker container
-                escaped = shlex.quote(command)
-                rewritten = f"docker exec -i {self._container_id} bash -c {escaped}"
-
-                result = {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "updatedInput": {
-                            **tool_input,
-                            "command": rewritten,
-                        },
-                    }
-                }
-                if warn_msg:
-                    result["systemMessage"] = warn_msg
-                return result
-
-            if tool_name in ("WebFetch", "WebSearch"):
-                return {"systemMessage": warn_msg} if warn_msg else {}
-
-            # Everything else is denied — Glob/Grep/Read/Write/Edit/Agent/etc.
-            # would run on the host filesystem, breaking sandbox isolation.
-            # The model should use find/grep/cat/tee via bash instead.
-            redirect_hint = ""
+            hint = " Use `bash` (mcp__sandbox__bash) instead — it runs in the container."
             if tool_name in ("Glob", "Grep"):
-                redirect_hint = " Use `find` or `grep` via bash instead — those run in the container."
+                hint = " Use `find` or `grep` through `bash` instead — those run in the container."
             elif tool_name in ("Read", "Write", "Edit", "NotebookEdit"):
-                redirect_hint = " Use cat/head/tail to read, and tee/cat>file to write via bash."
+                hint = " Use cat/head/tail to read and tee/cat>file to write through `bash`."
 
             return {
-                "systemMessage": f"{tool_name} is not available — all work happens inside the Docker container.{redirect_hint}" if redirect_hint else "",
+                "systemMessage": f"{tool_name} is not available — all work happens inside the Docker container.{hint}",
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason": f"{tool_name} blocked — use bash for all operations inside the sandbox.",
+                    "permissionDecisionReason": f"{tool_name} is blocked.{hint}",
                 },
             }
 
@@ -236,8 +292,12 @@ class ClaudeSolver:
         async def _trace_post_tool_inner(input_data, tool_use_id, context):
             if input_data.get("hook_event_name") != "PostToolUse":
                 return {}
+            tool_name = input_data.get("tool_name", "?")
+            # run_in_sandbox() already traced the result and merged in findings.
+            if tool_name.startswith("mcp__sandbox__"):
+                return {}
             response_str = str(input_data.get("tool_response", ""))[:2000]
-            self.tracer.tool_result(input_data.get("tool_name", "?"), response_str[:500], self._step_count)
+            self.tracer.tool_result(tool_name, response_str[:500], self._step_count)
 
             if self._step_count % 5 == 0 and self.message_bus:
                 from backend.tools.core import do_check_findings
@@ -251,16 +311,17 @@ class ClaudeSolver:
                     }
             return {}
 
-        from backend.models import effort_from_spec
-        effort = effort_from_spec(self.model_spec)
-
         options = ClaudeAgentOptions(
             model=self.model_id,
             system_prompt=system_prompt,
-            effort=effort,
+            effort=self.effort,
             # Clear CLAUDECODE to prevent nested-session rejection when run from coordinator
             env={"CLAUDECODE": ""},
-            allowed_tools=["Bash", "WebFetch", "WebSearch"],
+            # The sandbox tool replaces the native Bash tool: it executes through
+            # the Docker API, so solving never depends on a host shell.
+            mcp_servers={"sandbox": sandbox_server},
+            allowed_tools=["mcp__sandbox__bash", "WebFetch", "WebSearch", "StructuredOutput"],
+            disallowed_tools=HOST_TOOLS_TO_DENY,
             permission_mode="bypassPermissions",
             output_format={"type": "json_schema", "schema": solver_output_json_schema()},
             hooks={
