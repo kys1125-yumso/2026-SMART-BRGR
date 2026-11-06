@@ -36,7 +36,7 @@ from claude_agent_sdk import (
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
-from backend.models import model_id_from_spec
+from backend.models import effort_from_spec, model_id_from_spec
 from backend.output_types import solver_output_json_schema
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
@@ -83,8 +83,14 @@ class ClaudeSolver:
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
         )
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_id)
-        self.agent_name = f"{meta.name}/{self.model_id}"
+        # Two specs can share a model_id and differ only by effort (medium vs
+        # max). model_id alone would give both solvers the same trace filename
+        # and the same log prefix, so their events interleave in one file.
+        # effort stays None when the spec omits it; that is what the SDK wants.
+        self.effort = effort_from_spec(model_spec)
+        label = f"{self.model_id}-{self.effort or 'default'}"
+        self.tracer = SolverTracer(meta.name, label)
+        self.agent_name = f"{meta.name}/{label}"
 
         self._client: ClaudeSDKClient | None = None
         self._session_id: str | None = None
@@ -284,13 +290,10 @@ class ClaudeSolver:
                     }
             return {}
 
-        from backend.models import effort_from_spec
-        effort = effort_from_spec(self.model_spec)
-
         options = ClaudeAgentOptions(
             model=self.model_id,
             system_prompt=system_prompt,
-            effort=effort,
+            effort=self.effort,
             # Clear CLAUDECODE to prevent nested-session rejection when run from coordinator
             env={"CLAUDECODE": ""},
             # The sandbox tool replaces the native Bash tool: it executes through
