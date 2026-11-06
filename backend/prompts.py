@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +11,11 @@ from typing import Any
 import yaml
 
 from backend.tools.core import IMAGE_EXTS_FOR_VISION as IMAGE_EXTS
+
+# The contest's flag format, stated in every prompt so the operator does not
+# have to type it into each challenge description. Override per contest with
+# CTF_FLAG_FORMAT; set it to an empty string to leave the format out.
+FLAG_FORMAT = os.environ.get("CTF_FLAG_FORMAT", "DAKER{...}")
 
 
 @dataclass
@@ -153,6 +159,8 @@ def build_prompt(
     ]
     if meta.tags:
         lines.append(f"**Tags**    : {', '.join(meta.tags)}")
+    if FLAG_FORMAT:
+        lines.append(f"**Flag format**: `{FLAG_FORMAT}`")
     lines += ["", "## Description", meta.description or "_No description provided._", ""]
 
     if conn_info:
@@ -236,7 +244,13 @@ def build_prompt(
             "For RSA: use `RsaCtfTool`, sage ECM, or `cado-nfs`."
         ),
         "   - Pwn: `stty raw -echo` before launching vulnerable binaries over nc.",
-        '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
+        '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.'
+        + (
+            f" The real flag has the form `{FLAG_FORMAT}`; a candidate that does not match"
+            " it is not the answer, so keep going."
+            if FLAG_FORMAT
+            else ""
+        ),
         f"5. {submit_hint}",
         "6. Once CORRECT: output `FLAG: <value>` on its own line.",
         "7. **When stuck or unsure of a technique, read the matching `/skills/<cat>/` files before giving up.**",
