@@ -19,7 +19,7 @@ class SolverTracer:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d-%H%M%S")
         self.path = str(Path(log_dir) / f"trace-{_sanitize(challenge_name)}-{_sanitize(model_id)}-{ts}.jsonl")
-        self._fh = open(self.path, "a")
+        self._fh = open(self.path, "a", encoding="utf-8")
         atexit.register(self._close)
 
     def close(self) -> None:

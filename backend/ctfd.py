@@ -265,7 +265,8 @@ class CTFdClient:
             meta["hints"] = hints
 
         (ch_dir / "metadata.yml").write_text(
-            yaml.dump(meta, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            yaml.dump(meta, allow_unicode=True, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
         )
 
         return str(ch_dir)
