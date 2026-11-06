@@ -46,6 +46,27 @@ from backend.tracing import SolverTracer
 
 logger = logging.getLogger(__name__)
 
+# Native tools that would act on the host instead of the sandbox. The PreToolUse
+# hook already refuses them, but a refusal still costs a turn: traces show both
+# solvers spending their first three steps on Bash -> ToolSearch -> Read/
+# PowerShell/Agent before settling on mcp__sandbox__bash. Naming them here keeps
+# them out of the model's reach so it reaches for the sandbox tool first.
+HOST_TOOLS_TO_DENY = [
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "PowerShell",
+    "Read",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "Agent",
+    "ToolSearch",
+    "Skill",
+]
+
 
 class ClaudeSolver:
     """Claude Agent SDK solver using native tools redirected to Docker sandbox."""
@@ -300,6 +321,7 @@ class ClaudeSolver:
             # the Docker API, so solving never depends on a host shell.
             mcp_servers={"sandbox": sandbox_server},
             allowed_tools=["mcp__sandbox__bash", "WebFetch", "WebSearch", "StructuredOutput"],
+            disallowed_tools=HOST_TOOLS_TO_DENY,
             permission_mode="bypassPermissions",
             output_format={"type": "json_schema", "schema": solver_output_json_schema()},
             hooks={
